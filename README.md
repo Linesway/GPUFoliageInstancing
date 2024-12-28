@@ -1,4 +1,4 @@
-# VertexFactories
+# GPU Instancing Vertex Factories using DirectX12
 My DirectX12 Vertex Factories for GPU Instancing onto Marching Cubes surfaces
 
 https://github.com/user-attachments/assets/109425c0-f248-4862-8c70-b655b6b8dd3f
