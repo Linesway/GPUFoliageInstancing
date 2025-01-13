@@ -1,0 +1,169 @@
+﻿#include "/Engine/Public/Platform.ush"
+#include "fnl.ush"
+
+int3 WorldSize;
+int Size;
+float3 Position;
+int LOD;
+int Scale;
+
+int seed;
+
+RWStructuredBuffer<float> OutVoxels;
+
+struct KeyPoint
+{
+	float value;
+	float height;
+};
+
+// Linear interpolation function with fade
+float lerp(float a, float b, float t, float fade) {
+    if (t < fade)
+    {
+        return a + t * (b - a) / fade; // Apply fade
+    }
+    return b;
+}
+
+// Function to get terrain height based on continentalness
+float GetTerrainHeight3(float value, const KeyPoint Points[3], float fade)
+{
+	for (int i = 0; i < 2; ++i) {
+		if (value >= Points[i].value && value <= Points[i + 1].value) {
+			float t = (value - Points[i].value) / (Points[i + 1].value - Points[i].value);
+			return lerp(Points[i].height, Points[i + 1].height, t, fade);
+		}
+	}
+	return value < Points[0].value ? Points[0].height : Points[2].height;
+}
+
+float GetTerrainHeight2(float value, const KeyPoint Points[2], float fade)
+{
+	for (int i = 0; i < 1; ++i) {
+		if (value >= Points[i].value && value <= Points[i + 1].value) {
+			float t = (value - Points[i].value) / (Points[i + 1].value - Points[i].value);
+			return lerp(Points[i].height, Points[i + 1].height, t, fade);
+		}
+	}
+	return value < Points[0].value ? Points[0].height : Points[1].height;
+}
+
+float GetSquashingFactor(float height, float minHeight, float maxHeight, float minSquash, float maxSquash)
+{
+	if(height <= minHeight)
+		return minSquash;
+	if(height >= maxHeight)
+		return maxSquash;
+
+	float t = (height-minHeight)/(maxHeight-minHeight);
+	return lerp(minSquash, maxSquash, t);
+}
+
+//Get the voxel index from a position, size + 3 because voxels are sampled on points, and need access to ring around the cells.
+int GetVoxelIndex(int X, int Y, int Z)
+{
+	return Z * (Size + 4) * (Size + 4) + Y * (Size + 4) + X;
+}
+
+
+[numthreads(8, 8, 8)]
+void GetNoise(uint3 id : SV_DispatchThreadID)
+{
+	//So that the total number of iterations is Size + 4
+	if (id.x >= Size + 4 || id.y >= Size + 4 || id.z >= Size + 4) {
+		return;
+	}
+	
+	//Subtract the sampled noise position by 1 to get accurate margins.
+	float LODMultiplier = (1 << LOD);
+	float3 pos = float3(id) * (LODMultiplier * Scale) + Position;
+
+	if(abs(pos.x) > WorldSize.x || abs(pos.y) > WorldSize.y || pos.z > WorldSize.z)
+	{
+		OutVoxels[GetVoxelIndex(id.x, id.y, id.z)] = 1.0f;
+		return;
+	}
+	
+	float density = pos.z;
+	float height = 0;
+
+	fnl_state lowlandsState = fnlCreateState(seed + 21411);
+	lowlandsState.frequency = 0.005f;
+	lowlandsState.octaves = 4;
+	lowlandsState.fractal_type = 1;
+	float lowlandsAmplitude = 8.0f;
+	fnl_state highlandsState = fnlCreateState(seed + 223424);
+	highlandsState.frequency = 0.01f;
+	highlandsState.octaves = 5;
+	highlandsState.fractal_type = 1;
+	float highlandsAmplitude = 15.0f;
+	fnl_state mountainsState = fnlCreateState(seed + 325235);
+	mountainsState.frequency = 0.005f;
+	mountainsState.octaves = 4;
+	mountainsState.fractal_type = 1;
+	float mountainsAmplitude = 70.0f;
+
+	float lowlands = fnlGetNoise2D(lowlandsState, pos.x, pos.y) * lowlandsAmplitude - 20.0f;
+	float highlands = fnlGetNoise2D(highlandsState, pos.x, pos.y) * highlandsAmplitude;
+	float mountains = fnlGetNoise2D(mountainsState, pos.x, pos.y) * mountainsAmplitude;
+	const KeyPoint Points[3] =
+	{
+		{-0.6f, lowlands},
+		{0.4f, highlands},
+		{1.0f, mountains}
+	};
+	float baseHeight = GetTerrainHeight3(GetContinentalness(seed, pos), Points, 0.1f);
+	height += baseHeight;
+	density -= height;
+
+	fnl_state chaosState = fnlCreateState(seed + 325235);
+	chaosState.frequency = 0.01f;
+	chaosState.octaves = 3;
+	chaosState.fractal_type = 1;
+	float chaosAmplitude = 50.0f;
+	float chaos = fnlGetNoise3D(chaosState, pos.x, pos.y, pos.z) * chaosAmplitude;
+	const KeyPoint ChaosPoints[2] =
+	{
+		{-0.6f, chaos},
+		{1.0f, 0.0f}
+	};
+	density -= GetTerrainHeight2(GetChaos(seed, pos), ChaosPoints, 0.1f);
+
+	fnl_state cavesState = fnlCreateState(seed + 552356);
+	cavesState.frequency = 0.005f;
+    cavesState.octaves = 4;
+    cavesState.fractal_type = 1;
+
+	fnl_state cavesState2 = cavesState;
+	cavesState2.seed = seed + 12414;
+
+	//ridges will be near one
+	float3 cavePos = float3(pos.x, pos.y, pos.z * 1.35f);
+
+	float cave1 = fnlGetNoise3D(cavesState, cavePos.x, cavePos.y, cavePos.z);
+	float cave2 = fnlGetNoise3D(cavesState2, cavePos.x, cavePos.y, cavePos.z);
+	
+	float spaghettiCaves1 = 1 - abs(cave1);
+	float spaghettiCaves2 = 1 - abs(cave2);
+
+	float caves = spaghettiCaves1 * spaghettiCaves2;
+	//ridges are near 1, since 1 is air and -1 is stone this will yield ridged caves.
+	caves = caves * 2 - 1.4;
+	caves -= GetSquashingFactor(pos.z, -400.0f, 0, 0.1f, 0.32f);
+
+	float cheese = GetCheese(seed, pos);
+	cheese -= GetSquashingFactor(pos.z, -400.0f, 0, 0.1f, 0.55f);
+	
+	caves = max(caves, cheese);
+	density = max(caves, density);
+
+	density += max(-(WorldSize.z+pos.z)/128, 0);
+
+	float underworld = pos.z + WorldSize.z + 128;
+	underworld += baseHeight;
+	density = min(underworld, density);
+	
+	OutVoxels[GetVoxelIndex(id.x, id.y, id.z)] = density;
+}
+

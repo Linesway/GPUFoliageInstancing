@@ -1,0 +1,52 @@
+﻿#include "/Engine/Public/Platform.ush"
+#include "MarchTables.ush"
+
+int Size;
+
+globallycoherent RWStructuredBuffer<uint> cellMasks; //will be replaced with the start index
+globallycoherent RWStructuredBuffer<uint> NumAllocatedVerts;
+
+// Each voxel defines up to 12 potential vertices. Each voxel is only responsible for creating vertices 0, 3, and 8.
+// We rely on the neighboring voxels to create the rest of the vertices. Each voxel will keep 3 flags indicating
+// whether a vertex (0, 3, or 8) are referenced by a triangle within the current or neighboring vertices. Each voxel
+// also stores the index of where these vertices are stored in the vertex buffer. The stored index is the starting
+// index with the vertices written in the order: 0, 3, 8.
+// Below is a diagram showing the layout of each vertex for a given voxel.
+//        +--------5--------+
+//       /|                /|
+//      9 4              10 |
+//     /  |              /  6
+//    +----------1------+   |
+//    |   |             |   |
+//    |   +--------7----|---+
+//    0  /              2  /
+//    | 8               | 11
+//    |/                |/
+//    +---------3-------+
+
+[numthreads(8, 8, 8)]
+void March(uint3 id : SV_DispatchThreadID)
+{
+	//iterate up to index Size, so total Size + 1 are calculated.
+	if (id.x >= Size + 1 || id.y >= Size + 1 || id.z >= Size + 1) {
+		return;
+	}
+	
+	uint addr = id.x + id.y*(Size+1) + id.z*(Size+1)*(Size+1);
+	
+	int vertsToAlloc = 0;
+	uint mask = cellMasks[addr];
+	if (mask & 0x40000000) //New Vertices, so add 1 to vertsToAlloc.
+		vertsToAlloc++;
+	if (mask & 0x20000000)
+		vertsToAlloc++;
+	if (mask & 0x10000000)
+		vertsToAlloc++;
+
+	if(vertsToAlloc > 0)
+	{
+		int startIndex = 0;
+		InterlockedAdd(NumAllocatedVerts[0], vertsToAlloc, startIndex); //gives a unique random buffer position for each vertex
+		InterlockedOr(cellMasks[addr], startIndex); 
+	}
+}

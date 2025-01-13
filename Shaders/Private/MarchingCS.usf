@@ -1,0 +1,458 @@
+﻿#include "/Engine/Public/Platform.ush"
+#include "MarchTables.ush"
+#include "fnl.ush"
+
+int3 WorldSize;
+int Size;
+float isolevel;
+int LOD;
+int Scale;
+
+//for vertex color sampling
+float3 Position;
+int seed;
+
+Buffer<float> InVoxels;
+
+RWStructuredBuffer<uint> cellMasks;
+globallycoherent RWStructuredBuffer<uint> NumEmittedIndices;
+
+RWStructuredBuffer<float3> OutVertices;
+RWBuffer<uint> OutTris;
+RWStructuredBuffer<float3> OutNormals;
+RWStructuredBuffer<float4> OutColor;
+
+//Get the voxel index from a position, size + 3 because voxels are sampled on points and there is another margin for normals
+int GetVoxelIndex(int X, int Y, int Z)
+{
+	return Z * (Size + 4) * (Size + 4) + Y * (Size + 4) + X;
+}
+
+// VertexToIndex converts a vertex index into a relative index
+// in reference to the owning voxel.  For instance, in the following
+// diagram, only vertices labeled 0, 3, and 8 are owned by the current
+// voxel. All other vertices are owned by the neighboring voxels.
+// The diagram is supposed to represent the surrounding voxels (without
+// showing the neighboring voxels in the Z direction) and which voxels
+// own which vertices.
+//                                      +-----------------+      +-----------------+ 
+//                                     /|                /|     /|                /| 
+//                                    / |               / |    / |               / | 
+//                                   /  |              /  |   /  |              /  | 
+//                                  +-----------------+   |  +-----------------+   | 
+//                                  |   |             |   |  |   |             |   | 
+//                                  |   +-------------|---+  |   +-------------|---+ 
+//                                  |  /              |  /   |  /              |  /  
+//                                  | 9               | /    | 10              | /  
+//                                  |/                |/     |/                |/    
+//                                  +---------1-------+      +-----------------+     
+//        +--------5--------+           +-----------------+      +-----------------+ 
+//       /|                /|          /|                /|     /|                /| 
+//      9 4              10 |         / |               / |    / |               / | 
+//     /  |              /  6        /  |              /  |   /  |              /  | 
+//    +----------1------+   |       +-----------------+   |  +-----------------+   | 
+//    |   |             |   |   =>  |   |             |   |  |   |             |   | 
+//    |   +--------7----|---+       |   +-------------|---+  |   +-------------|---+ 
+//    0  /              2  /        0  /              |  /   2  /              |  /  
+//    | 8               | 11        | 8               | /    | 11              | /  
+//    |/                |/          |/                |/     |/                |/    
+//    +---------3-------+           +-------3---------+      +-----------------+
+//
+// Each of these groups/voxel are then renumbered such that the vertices in the 0,3, and 8
+// positions become 0, 1, 2. i.e. vertices 8, 9, 10, 11 all become 2. This renumbering matches
+// the ordering that vertices are output to the vertex buffer.
+uint VertexToIndex(uint va, int vi)
+{
+    // Not all vertices are referenced. Thus if only vertices 8 and 3 were referenced
+    // our relative indices would become 1 and 0, whereas if all 3 vertices (0, 3, 8)
+    // were referenced, our relative indices would become 0, 1, 2.
+    // Using our cellMasks flags we can determine the correct mapping as:
+    //     x000 = . . .
+    //     x001 = . . 0
+    //     x010 = . 0 .
+    //     x011 = . 0 1
+    //     x100 = 0 . .
+    //     x101 = 0 . 1
+    //     x110 = 0 1 .
+    //     x111 = 0 1 2
+    // where 'x' is the high bit on the cellMask, and . is a don't care state (since
+    // vertex is unreferenced.
+    int relOffset0 = 0;
+    int relOffset1 = 0;
+    int relOffset2 = 0;
+    switch (cellMasks[va] & 0x70000000) //see which case it is, mask with 0111....
+    {
+        case 0x00000000: break;
+        case 0x10000000: relOffset2 = 0; break;
+        case 0x20000000: relOffset1 = 0; break;
+        case 0x30000000: relOffset1 = 0; relOffset2 = 1; break;
+        case 0x40000000: relOffset0 = 0; break;
+        case 0x50000000: relOffset0 = 0; relOffset2 = 1; break;
+        case 0x60000000: relOffset0 = 0; relOffset1 = 1; break;
+        case 0x70000000: relOffset0 = 0; relOffset1 = 1; relOffset2 = 2; break; // all three bits are set so return 0 1 2
+    }
+    int relativeID = 0;
+    switch (vi)
+    {
+        default:
+        case 0: relativeID = relOffset0; break;
+        case 1: relativeID = relOffset1; break;
+        case 2: relativeID = relOffset0; break;
+        case 3: relativeID = relOffset1; break;
+        case 4: relativeID = relOffset0; break;
+        case 5: relativeID = relOffset1; break;
+        case 6: relativeID = relOffset0; break;
+        case 7: relativeID = relOffset1; break;
+        case 8: relativeID = relOffset2; break;
+        case 9: relativeID = relOffset2; break;
+        case 10: relativeID = relOffset2; break;
+        case 11: relativeID = relOffset2; break;
+    }
+    int vbAddr = cellMasks[va] & 0xFFFFFF;
+	
+    return vbAddr + relativeID;
+}
+
+// VertexIDToVoxelAddr() converts a vertexId (0-12) for
+// the specified voxel (addr) into the voxel address that
+// has the info for that vertex. For instance, vertex 7 info
+// will be stored as vertex 3 info in the voxel neighbor
+// at +1 in Z (in our voxel grid)
+//        +--------5--------+
+//       /|                /|
+//      9 4              10 |
+//     /  |              /  6
+//    +----------1------+   |
+//    |   |             |   |
+//    |   +--------7----|---+
+//    0  /              2  /
+//    | 8               | 11
+//    |/                |/
+//    +---------3-------+
+uint VertexIDToVoxelAddr(uint3 pos, int vertexId)
+{
+	uint stepx = 0, stepy = 0, stepz = 0;
+	switch (vertexId)
+	{
+	case 0:            break;
+	case 1: stepy = 1; break;
+	case 2: stepx = 1; break;
+	case 3:            break;
+	case 4:            stepz = 1; break;
+	case 5: stepy = 1; stepz = 1; break;
+	case 6: stepx = 1; stepz = 1; break;
+	case 7:            stepz = 1; break;
+	case 8:                        break;
+	case 9:             stepy = 1; break;
+	case 10: stepx = 1; stepy = 1; break;
+	case 11: stepx = 1;            break;
+	}
+	// determine the address of the voxel that owns the vertex on edge e0.
+	// Then set the flags on the owner voxel (see mask[] for description)
+	// Finally increment our vertex count if the original value didn't have the use bit set (i.e. it didn't but now does, so we need to generate that vertex)
+	return (pos.x + stepx) + (pos.y + stepy)*(Size+1) + (pos.z + stepz)*(Size+1)*(Size+1);
+}
+
+float3 VertexInterp(float3 p1, float3 p2, float valp1, float valp2)
+{
+	float delta = (isolevel - valp1) / (valp2 - valp1);
+	float3 p = float3(0,0,0);
+
+	if (abs(isolevel-valp1) < 0.00001)
+		return(p1);
+	if (abs(isolevel-valp2) < 0.00001)
+		return(p2);
+	if (abs(valp1-valp2) < 0.00001)
+		return(p1);
+
+	p.x = p1.x + delta * (p2.x - p1.x);
+	p.y = p1.y + delta * (p2.y - p1.y);
+	p.z = p1.z + delta * (p2.z - p1.z);
+
+	return(p);
+}
+
+float3 GetVoxelNormal(float3 VoxelPosition)
+{
+	float3 VoxelNormal = float3(0,0,0);
+	
+	VoxelNormal.x = InVoxels[GetVoxelIndex(VoxelPosition.x + 1, VoxelPosition.y, VoxelPosition.z)] -
+		InVoxels[GetVoxelIndex(VoxelPosition.x - 1, VoxelPosition.y, VoxelPosition.z)];
+	
+	VoxelNormal.y = InVoxels[GetVoxelIndex(VoxelPosition.x, VoxelPosition.y + 1, VoxelPosition.z)] -
+	InVoxels[GetVoxelIndex(VoxelPosition.x, VoxelPosition.y - 1, VoxelPosition.z)];
+	
+	VoxelNormal.z = InVoxels[GetVoxelIndex(VoxelPosition.x, VoxelPosition.y, VoxelPosition.z + 1)] -
+	InVoxels[GetVoxelIndex(VoxelPosition.x, VoxelPosition.y, VoxelPosition.z - 1)];
+
+	VoxelNormal = normalize(VoxelNormal);
+	return VoxelNormal;
+}
+
+float3 NormalInterp(float3 n1, float3 n2, float valp1, float valp2)
+{
+	float3 n = float3(0,0,0);
+
+	if (abs(isolevel-valp1) < 0.00001)
+		return(n1);
+	if (abs(isolevel-valp2) < 0.00001)
+		return(n2);
+	if (abs(valp1-valp2) < 0.00001)
+		return(n1);
+
+	float delta = (isolevel - valp1) / (valp2 - valp1);
+
+	n.x = n1.x + delta * (n2.x - n1.x);
+	n.y = n1.y + delta * (n2.y - n1.y);
+	n.z = n1.z + delta * (n2.z - n1.z);
+	
+	return n;
+}
+
+float3 GetVertexNormal(float3 p1, float3 p2)
+{
+	float3 p1f = float3(p1.x + 2, p1.y + 2, p1.z + 2);
+	float3 p2f = float3(p2.x + 2, p2.y + 2, p2.z + 2);
+	//Add both positions by 1 to fit within the margin of GetVoxelIndex() for correct voxel values.
+
+	//CHANGING THE OFFSET CHANGES HOW MUCH ARE FRICKED!!!!!!!!
+	float3 n1 = GetVoxelNormal(p1f);
+	float3 n2 = GetVoxelNormal(p2f);
+	
+	float valp1 = InVoxels[GetVoxelIndex(p1f.x, p1f.y, p1f.z)];
+	float valp2 = InVoxels[GetVoxelIndex(p2f.x, p2f.y, p2f.z)];
+
+	return normalize(NormalInterp(n1, n2, valp1, valp2));
+}
+
+int GetBiome2(float value, const float Points[2])
+{
+	for (int i = 0; i < 1; ++i) {
+		if (value >= Points[i] && value <= Points[i + 1]) {
+			return i+1;
+		}
+	}
+	return value < Points[0] ? 0 : 1;
+}
+int GetBiome3(float value, const float Points[3])
+{
+	for (int i = 0; i < 2; ++i) {
+		if (value >= Points[i] && value <= Points[i + 1]) {
+			return i+1;
+		}
+	}
+	return value < Points[0] ? 0 : 2;
+}
+
+float4 GetVertexColor(float3 vertPos)
+{
+	float4 red = float4(1,0,0,1), green = float4(0,1,0,1), blue = float4(0,0,1,1), black = float4(0,0,0,1), yellow = float4(1,1,0,1),
+	purple = float4(1,0,1,1), grey = float4(0.5, 0.5, 0.5, 1), brown = float4(0.5, 0.5, 0, 1), white = float4(1,1,1,1),
+	darkblue = float4(0,0,0.5,1), darkpurple = float4(0.5, 0, 0.5, 1), darkred = float4(0.5,0,0,1);
+	
+	float3 absPos = vertPos * (1 << LOD) * Scale + Position;
+
+	const float ContinentalnessPoints[3] =
+	{
+		-0.6f, //lowlands
+		0.4f, //highlands,
+		1.0f, //mountains
+	};
+	const float ChaosPoints[2] =
+	{
+		-0.6f,
+		1.0f,
+	};
+	const float TemperaturePoints[3] =
+	{
+		-0.3f, 0.3f, 1.0f
+	};
+	const float UndergroundBiomePoints[2] =
+	{
+		0.0f,
+		1.0f,
+	};
+
+	int continentalness = GetBiome3(GetContinentalness(seed, absPos), ContinentalnessPoints);
+	int chaos = GetBiome2(GetChaos(seed, absPos), ChaosPoints);
+	int temperature = GetBiome3(GetTemperature(seed, absPos), TemperaturePoints);
+	int underground = GetUnderground(absPos);
+	int undergroundbiome = GetBiome2(GetCheese(seed, absPos), UndergroundBiomePoints);
+	float underworld = absPos.z + WorldSize.z;
+
+	float dirtstoneNoise = GetDirtStone(seed, absPos);
+	int dirtstone = dirtstoneNoise < 0.0f ? 1 : 0;
+	/*
+	 *
+	continentalness
+		 0(lowlands)	cold: overworld		cold: corruption
+						mid: jungle			mid: overworld
+						hot: desert			hot: drygrass
+		 
+		 1(highlands)	cold: snow			cold: overworld
+						mid: overworld		mid: drygrass
+						hot: desert			hot: jungle
+						
+		 
+		 2(mountains)	cold: snow			cold:snow
+						mid: corruption		mid: corruption
+						hot: jungle			hot: jungle
+	chaos				0					1
+	 */
+	 
+	 /*
+	  undergroundbiome
+
+					marble	granite	mushroom
+	  temperature	cold	mid		hot
+	 */
+	float4 overworld = underground ? (dirtstone ? brown : grey) : black;
+	float4 dryoverworld = underground ? (dirtstone ? brown : grey) : red;
+
+	if(underworld < 0)
+	{
+		return darkred;
+	}
+	if(absPos.z < -96)
+	{
+		switch(undergroundbiome)
+	    {
+		    case 1:
+		        return darkblue;
+	    }
+	}
+	switch (continentalness)
+	{
+		case 0:  // Lowlands
+			switch (temperature)
+			{
+				case 0: return chaos ? purple : overworld;
+				case 1: return chaos ? overworld : green;
+				case 2: return chaos ? dryoverworld : yellow;
+			}
+		case 1:  // Highlands
+			switch (temperature)
+			{
+				case 0: return chaos ? overworld : blue;
+				case 1: return chaos ? dryoverworld : green;
+				case 2: return chaos ? green : yellow;
+			}
+		case 2:  // Mountains
+			switch (temperature)
+			{
+				case 0: return chaos ? blue : blue;
+				case 1: return chaos ? purple : purple;
+				case 2: return chaos ? green : green;
+			}
+	}
+	return black;
+}
+
+void EmitVertex(uint vbAddr, float3 edgePos, float3 vertexNormal)
+{
+	OutVertices[vbAddr] = edgePos * 100 * (1 << LOD) * Scale; 
+	OutNormals[vbAddr] = vertexNormal;
+	OutColor[vbAddr] = GetVertexColor(edgePos);
+}
+
+[numthreads(8, 8, 8)]
+void March(uint3 id : SV_DispatchThreadID)
+{
+	//iterate up to index Size, so total Size + 1 are calculated.
+    if (id.x >= Size + 1 || id.y >= Size + 1 || id.z >= Size + 1) {
+        return;
+    }
+
+	//voxelid offset by 1 so that it samples within the margin of voxels which are size + 3
+	uint3 voxelid = uint3(id.x + 2, id.y + 2, id.z + 2);
+	
+	//Fill in the 8 corners of the cube (use nvidia's coordinate system)
+	float cube[8] = {
+		InVoxels[GetVoxelIndex(voxelid.x, voxelid.y, voxelid.z)],
+		InVoxels[GetVoxelIndex(voxelid.x, voxelid.y + 1, voxelid.z)],
+		InVoxels[GetVoxelIndex(voxelid.x + 1, voxelid.y + 1, voxelid.z)],
+		InVoxels[GetVoxelIndex(voxelid.x + 1, voxelid.y, voxelid.z)],
+		InVoxels[GetVoxelIndex(voxelid.x, voxelid.y, voxelid.z + 1)],
+		InVoxels[GetVoxelIndex(voxelid.x, voxelid.y + 1, voxelid.z + 1)],
+		InVoxels[GetVoxelIndex(voxelid.x + 1, voxelid.y + 1, voxelid.z + 1)],
+		InVoxels[GetVoxelIndex(voxelid.x + 1, voxelid.y , voxelid.z + 1)]
+	};
+	
+	//id position already included in cube position (using nvidia's coordinate system again)
+	//use true id here to get real position.
+	float3 cubepos[8] = {
+		float3(id.x, id.y, id.z),
+		float3(id.x, id.y + 1, id.z),
+		float3(id.x + 1, id.y + 1, id.z),
+		float3(id.x + 1, id.y, id.z),
+		float3(id.x, id.y, id.z + 1),
+		float3(id.x, id.y + 1, id.z+ 1),
+		float3(id.x + 1, id.y + 1, id.z + 1),
+		float3(id.x + 1, id.y, id.z + 1)
+	};
+	
+	// From the density values determine the code defining the cube configuration
+	uint code = 0;
+	for (int i = 7; i >= 0; --i) {
+		code = (code << 1) | ((cube[i] >= isolevel) ? 1 : 0);
+	}
+	
+	float3 vertlist[12];
+	float3 normlist[12];
+	
+	uint addr = id.x + id.y*(Size+1) + id.z*(Size+1)*(Size+1);
+	uint mask = cellMasks[addr]; 
+
+	int vbAddr = cellMasks[addr] & 0xFFFFFF; //random unique buffer address for each vertex in a voxel
+	int offset = 0;
+	if (mask & 0x40000000) //if there is no edge 0 then emit edge 0
+	{
+		vertlist[0] = VertexInterp(cubepos[0],cubepos[1],cube[0],cube[1]);
+		normlist[0] = GetVertexNormal(cubepos[0], cubepos[1]);
+		
+		EmitVertex(vbAddr, vertlist[0], normlist[0]);
+		offset++;
+	}
+	if (mask & 0x20000000) //if there is no edge 3 then emit edge 3
+	{
+		vertlist[3] = VertexInterp(cubepos[0],cubepos[3],cube[0],cube[3]);
+		normlist[3] = GetVertexNormal(cubepos[0], cubepos[3]);
+		
+		EmitVertex(vbAddr + offset, vertlist[3], normlist[3]);
+		offset++;
+	}
+	if (mask & 0x10000000) //if there is no edge 8 then emit edge 8
+	{
+		vertlist[8] = VertexInterp(cubepos[0],cubepos[4],cube[0],cube[4]);
+		normlist[8] = GetVertexNormal(cubepos[0], cubepos[4]);
+		
+		EmitVertex(vbAddr + offset, vertlist[8], normlist[8]);
+		offset++;
+	}
+
+	//Only triangulate up to Size
+	if (id.x >= Size || id.y >= Size || id.z >= Size) {
+		return;
+	}
+
+	int numPolys = casetonumpolys[code];
+	
+	/*startIndex gives random unique triangle buffer location for each triangle index
+	 which is okay because triangle position in buffer doesn't matter as long as its unique*/
+	uint startIndex = 0;
+
+	InterlockedAdd(NumEmittedIndices[0], numPolys * 3, startIndex); 
+	
+	for (int i = 0; i < numPolys; i++)
+	{
+		//If the connection table is not -1 then this a triangle.
+		uint i0 = TriTable[code][3 * i + 0];
+		uint i1 = TriTable[code][3 * i + 1];
+		uint i2 = TriTable[code][3 * i + 2];
+			
+		OutTris[startIndex + 3*i + 0] = VertexToIndex(VertexIDToVoxelAddr(id, i0), i0);
+		OutTris[startIndex + 3*i + 1] = VertexToIndex(VertexIDToVoxelAddr(id, i1), i1);
+		OutTris[startIndex + 3*i + 2] = VertexToIndex(VertexIDToVoxelAddr(id, i2), i2);
+	}
+}
+
